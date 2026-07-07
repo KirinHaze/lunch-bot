@@ -14,7 +14,6 @@ LINE_CHANNEL_SECRET = os.environ.get("LINE_CHANNEL_SECRET")
 line_bot_api = LineBotApi(LINE_CHANNEL_ACCESS_TOKEN)
 handler = WebhookHandler(LINE_CHANNEL_SECRET)
 
-# ── 狀態儲存（記憶體版）──
 sessions = {}
 
 def get_source_id(event):
@@ -62,6 +61,17 @@ def build_summary(orders, title="📋 訂餐明細"):
 
     return "\n".join(lines)
 
+def parse_order_line(line):
+    """解析單行訂單，成功回傳 (name, meal, price)，失敗回傳 None"""
+    match = re.match(r'^(\S+)\s+(\S+)\s+\$(\d+(\.\d+)?)$', line.strip())
+    if match:
+        name = match.group(1)
+        meal = match.group(2)
+        price = float(match.group(3))
+        price_display = int(price) if price == int(price) else price
+        return name, meal, price_display
+    return None
+
 @app.route("/callback", methods=["POST"])
 def callback():
     signature = request.headers["X-Line-Signature"]
@@ -94,9 +104,13 @@ def handle_message(event):
         session["orders"] = {}
         reply = (
             "🍱 開始接受訂單！\n\n"
-            "📌 訂餐格式：\n"
+            "📌 單筆格式：\n"
             "   姓名 餐點 $價格\n"
             "   例：小明 雞腿便當 $80\n\n"
+            "📌 多筆格式（換行輸入）：\n"
+            "   小明 雞腿便當 $80\n"
+            "   小花 排骨便當 $75\n"
+            "   大雄 滷肉飯 $60\n\n"
             "📌 其他指令：\n"
             "   !! → 查看明細\n"
             "   刪除 訂單號碼 → 刪除訂單\n"
@@ -165,29 +179,46 @@ def handle_message(event):
         )
         return
 
-    # ── 5. 登記訂單（格式：姓名 餐點 $價格）──
+    # ── 5. 登記訂單（單筆或多筆）──
     if session["active"]:
-        match = re.match(r'^(\S+)\s+(\S+)\s+\$(\d+(\.\d+)?)$', text)
-        if match:
-            name = match.group(1)
-            meal = match.group(2)
-            price = float(match.group(3))
-            price_display = int(price) if price == int(price) else price
+        lines = text.splitlines()
+        # 過濾空行
+        lines = [l.strip() for l in lines if l.strip()]
 
-            order_id = session["next_order_id"]
-            session["orders"][order_id] = {
-                "name": name,
-                "meal": meal,
-                "price": price_display
-            }
-            session["next_order_id"] += 1
+        # 嘗試解析每一行
+        parsed = []
+        failed = []
+        for line in lines:
+            result = parse_order_line(line)
+            if result:
+                parsed.append(result)
+            else:
+                failed.append(line)
+
+        # 有成功解析的訂單
+        if parsed:
+            reply_lines = []
+            for name, meal, price in parsed:
+                order_id = session["next_order_id"]
+                session["orders"][order_id] = {
+                    "name": name,
+                    "meal": meal,
+                    "price": price
+                }
+                session["next_order_id"] += 1
+                reply_lines.append(f"   訂單 #{order_id}：{name} — {meal} ${price}")
+
+            reply = f"✅ 收到 {len(parsed)} 筆訂單！\n" + "\n".join(reply_lines)
+
+            # 如果有部分行解析失敗
+            if failed:
+                reply += f"\n\n⚠️ 以下 {len(failed)} 行格式有誤，未登記：\n"
+                reply += "\n".join([f"   {l}" for l in failed])
+                reply += "\n\n格式請參考：姓名 餐點 $價格"
 
             line_bot_api.reply_message(
                 event.reply_token,
-                TextSendMessage(
-                    text=f"✅ 收到！\n"
-                         f"   訂單 #{order_id}：{name} — {meal} ${price_display}"
-                )
+                TextSendMessage(text=reply)
             )
             return
 
