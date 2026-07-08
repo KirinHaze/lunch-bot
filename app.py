@@ -5,8 +5,7 @@ from collections import Counter
 from flask import Flask, request, abort
 from linebot import LineBotApi, WebhookHandler
 from linebot.exceptions import InvalidSignatureError
-from linebot.models import (MessageEvent, TextMessage, TextSendMessage, JoinEvent)
-
+from linebot.models import MessageEvent, TextMessage, TextSendMessage, JoinEvent
 import gspread
 from google.oauth2.service_account import Credentials
 
@@ -20,7 +19,7 @@ GOOGLE_CREDENTIALS_JSON = os.environ.get("GOOGLE_CREDENTIALS_JSON")
 line_bot_api = LineBotApi(LINE_CHANNEL_ACCESS_TOKEN)
 handler = WebhookHandler(LINE_CHANNEL_SECRET)
 
-# 設定：要使用 Google Sheets 作為持久儲存
+# ── Google Sheets 連線 ──
 def get_sheet():
     scopes = [
         "https://www.googleapis.com/auth/spreadsheets",
@@ -31,9 +30,58 @@ def get_sheet():
     client = gspread.authorize(creds)
     return client.open_by_key(GOOGLE_SHEET_ID).sheet1
 
-# Session 管理（以 source_id 為單位）
-sessions = {}
+# ── 從 Sheet 讀取該來源的訂單 ──
+def load_orders(sheet, source_id):
+    records = sheet.get_all_records()
+    orders = {}
+    for r in records:
+        if str(r["source_id"]) == str(source_id) and str(r["order_id"]) != "0":
+            try:
+                price = float(r["price"]) if r["price"] != "" else 0
+                price = int(price) if price == int(price) else price
+            except (ValueError, TypeError):
+                price = 0
+            orders[int(r["order_id"])] = {
+                "name": str(r["name"]),
+                "meal": str(r["meal"]),
+                "price": price
+            }
+    return orders
 
+# ── 從 Sheet 讀取狀態 ──
+def load_status(sheet, source_id):
+    records = sheet.get_all_records()
+    for r in records:
+        if str(r["source_id"]) == str(source_id) and str(r["order_id"]) == "0":
+            return str(r["name"]) == "active"
+    return False
+
+# ── 寫入狀態列 ──
+def save_status(sheet, source_id, active):
+    records = sheet.get_all_records()
+    for i, r in enumerate(records):
+        if str(r["source_id"]) == str(source_id) and str(r["order_id"]) == "0":
+            sheet.update_cell(i + 2, 3, "active" if active else "inactive")
+            return
+    sheet.append_row([source_id, 0, "active" if active else "inactive", "", ""])
+
+# ── 清除該來源所有訂單（保留狀態列）──
+def clear_orders(sheet, source_id):
+    records = sheet.get_all_records()
+    rows_to_delete = []
+    for i, r in enumerate(records):
+        if str(r["source_id"]) == str(source_id) and str(r["order_id"]) != "0":
+            rows_to_delete.append(i + 2)
+    for row in sorted(rows_to_delete, reverse=True):
+        sheet.delete_rows(row)
+
+# ── 取得下一個訂單號碼 ──
+def get_next_id(orders):
+    if not orders:
+        return 1
+    return max(orders.keys()) + 1
+
+# ── 取得來源 ID ──
 def get_source_id(event):
     source = event.source
     if source.type == "group":
@@ -43,17 +91,8 @@ def get_source_id(event):
     else:
         return source.user_id
 
-def get_session(source_id):
-    if source_id not in sessions:
-        sessions[source_id] = {"active": False, "next_order_id": 1, "orders": {}}
-    return sessions[source_id]
-
+# ── 解析單行訂單 ──
 def parse_order_line(line):
-    """
-    解析單行格式: 姓名 餐點 $價格
-    回傳 (name, meal, price) 或 None
-    支援整數或小數價格。
-    """
     m = re.match(r'^(\S+)\s+(\S+)\s+\$(\d+(\.\d+)?)$', line.strip())
     if not m:
         return None
@@ -63,38 +102,40 @@ def parse_order_line(line):
     price_display = int(price) if price == int(price) else price
     return name, meal, price_display
 
+# ── 產生明細摘要 ──
 def build_summary(orders, title="📋 訂餐明細"):
-    """根據訂單字典產生摘要字串"""
     lines = [title, ""]
     lines.append("─────────────────")
-
     total_amount = 0
     for oid, o in sorted(orders.items()):
         lines.append(f"#{oid}  {o['name']}　{o['meal']}　${o['price']}")
-        total_amount += o['price']
-
+        try:
+            total_amount += float(o['price'])
+        except (ValueError, TypeError):
+            pass
+    total_amount = int(total_amount) if total_amount == int(total_amount) else total_amount
     lines.append("─────────────────")
-
     meal_counter = Counter(o['meal'] for o in orders.values())
     lines.append("📊 數量小計：")
     for meal, count in meal_counter.most_common():
         lines.append(f"   {meal} × {count}")
-
     lines.append("")
-
     name_total = {}
     for o in orders.values():
-        name_total[o['name']] = name_total.get(o['name'], 0) + o['price']
+        try:
+            name_total[o['name']] = name_total.get(o['name'], 0) + float(o['price'])
+        except (ValueError, TypeError):
+            pass
     lines.append("💰 金額小計（每人）：")
     for name, amt in name_total.items():
+        amt = int(amt) if amt == int(amt) else amt
         lines.append(f"   {name}：${amt}")
-
     lines.append("")
     lines.append(f"💵 總金額：${total_amount}")
     lines.append(f"🧾 共 {len(orders)} 筆訂單")
-
     return "\n".join(lines)
 
+# ── Webhook ──
 @app.route("/callback", methods=["POST"])
 def callback():
     signature = request.headers["X-Line-Signature"]
@@ -109,31 +150,35 @@ def callback():
 def handle_join(event):
     line_bot_api.reply_message(
         event.reply_token,
-        TextSendMessage(
-            text="🍱 午餐整理大師已加入！\n\n輸入「開始點餐」來開始接受訂單。"
-        )
+        TextSendMessage(text="🍱 午餐整理大師已加入！\n\n輸入「開始點餐」來開始接受訂單。")
     )
 
 @handler.add(MessageEvent, message=TextMessage)
 def handle_message(event):
     text = event.message.text.strip()
     source_id = get_source_id(event)
-    session = get_session(source_id)
+
+    try:
+        sheet = get_sheet()
+    except Exception as e:
+        line_bot_api.reply_message(
+            event.reply_token,
+            TextSendMessage(text=f"⚠️ 無法連線到資料庫，請稍後再試。\n錯誤：{str(e)}")
+        )
+        return
 
     # 1) 開始點餐
     if text == "開始點餐":
-        session["active"] = True
-        session["next_order_id"] = 1
-        session["orders"] = {}
+        clear_orders(sheet, source_id)
+        save_status(sheet, source_id, True)
         reply = (
             "🍱 開始接受訂單！\n\n"
             "📌 單筆格式：\n"
             "   姓名 餐點 $價格\n"
             "   例：小明 雞腿便當 $80\n\n"
-            "📌 多筆格式（換行輸入）：直接逐行輸入即可，例如：\n"
+            "📌 多筆格式（換行輸入）：\n"
             "   小明 雞腿便當 $80\n"
-            "   小花 排骨便當 $75\n"
-            "   大雄 滷肉飯 $60\n\n"
+            "   小花 排骨便當 $75\n\n"
             "📌 其他指令：\n"
             "   !! → 查看明細\n"
             "   刪除 訂單號碼 → 刪除訂單\n"
@@ -144,14 +189,15 @@ def handle_message(event):
 
     # 2) 結束訂單
     if text == "結束訂單":
-        orders = session["orders"]
-        if not session["active"] and not orders:
+        orders = load_orders(sheet, source_id)
+        active = load_status(sheet, source_id)
+        if not active and not orders:
             line_bot_api.reply_message(
                 event.reply_token,
                 TextSendMessage(text="⚠️ 目前沒有進行中的訂單。")
             )
             return
-        session["active"] = False
+        save_status(sheet, source_id, False)
         if not orders:
             line_bot_api.reply_message(
                 event.reply_token,
@@ -164,14 +210,15 @@ def handle_message(event):
 
     # 3) 查看明細
     if text == "!!":
-        orders = session["orders"]
+        orders = load_orders(sheet, source_id)
         if not orders:
             line_bot_api.reply_message(
                 event.reply_token,
                 TextSendMessage(text="📭 目前沒有任何訂單。")
             )
             return
-        status = "（接受中）" if session["active"] else "（已結束）"
+        active = load_status(sheet, source_id)
+        status = "（接受中）" if active else "（已結束）"
         reply = build_summary(orders, title=f"📋 訂餐明細 {status}")
         line_bot_api.reply_message(event.reply_token, TextSendMessage(text=reply))
         return
@@ -186,14 +233,19 @@ def handle_message(event):
             )
             return
         order_id = int(parts[1])
-        orders = session["orders"]
+        orders = load_orders(sheet, source_id)
         if order_id not in orders:
             line_bot_api.reply_message(
                 event.reply_token,
                 TextSendMessage(text=f"⚠️ 找不到訂單編號 #{order_id}，請確認號碼是否正確。")
             )
             return
-        deleted = orders.pop(order_id)
+        records = sheet.get_all_records()
+        for i, r in enumerate(records):
+            if str(r["source_id"]) == str(source_id) and str(r["order_id"]) == str(order_id):
+                sheet.delete_rows(i + 2)
+                break
+        deleted = orders[order_id]
         line_bot_api.reply_message(
             event.reply_token,
             TextSendMessage(
@@ -203,11 +255,11 @@ def handle_message(event):
         )
         return
 
-    # 5) 登記訂單（支援多行）
-    if session["active"]:
+    # 5) 登記訂單
+    active = load_status(sheet, source_id)
+    if active:
         lines = text.splitlines()
         lines = [l.strip() for l in lines if l.strip()]
-
         parsed = []
         failed = []
         for line in lines:
@@ -218,21 +270,18 @@ def handle_message(event):
                 failed.append(line)
 
         if parsed:
+            orders = load_orders(sheet, source_id)
+            next_id = get_next_id(orders)
             reply_lines = []
-            orders_map = session["orders"]
-            next_id = session["next_order_id"]
             for name, meal, price in parsed:
-                orders_map[next_id] = {"name": name, "meal": meal, "price": price}
+                sheet.append_row([source_id, next_id, name, meal, price])
                 reply_lines.append(f"   訂單 #{next_id}：{name} — {meal} ${price}")
                 next_id += 1
-            session["next_order_id"] = next_id
-
             reply = f"✅ 收到 {len(parsed)} 筆訂單！\n" + "\n".join(reply_lines)
             if failed:
-                reply += f"\n\n⚠️ 以下 {len(failed)} 行格式有誤，未登記：\n" + \
-                         "\n".join([f"   {l}" for l in failed]) + \
-                         "\n\n格式請參考：姓名 餐點 $價格"
-
+                reply += f"\n\n⚠️ 以下 {len(failed)} 行格式有誤，未登記：\n"
+                reply += "\n".join([f"   {l}" for l in failed])
+                reply += "\n\n格式請參考：姓名 餐點 $價格"
             line_bot_api.reply_message(event.reply_token, TextSendMessage(text=reply))
             return
 
